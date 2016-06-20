@@ -35,7 +35,7 @@
 -------------------------------------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.zz_log (lib_schema character varying,lib_table character varying,lib_champ character varying,typ_log character varying,lib_log character varying,nb_occurence character varying,date_log timestamp);
 CREATE TABLE IF NOT EXISTS public.bilan (uid integer NOT NULL,lib_cbn character varying,data_nb_releve integer,data_nb_observation integer,data_nb_taxon integer,taxa_nb_taxon integer,taxa_pourcentage_statut character varying,CONSTRAINT bilan_pkey PRIMARY KEY (uid))WITH (OIDS=FALSE);
-
+CREATE TABLE IF NOT EXISTS public.threecol (col1 varchar, col2 varchar, col3 varchar);
 ---------------------------------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------------------------------
 --- Nom : hub_admin_init
@@ -68,7 +68,7 @@ cmd = 'SELECT routine_name||''(''||string_agg(data_type ,'','')||'')'' FROM(
 	GROUP BY routine_name, specific_name';
 --- Suppression de ces fonctions
 FOR fonction IN EXECUTE cmd
-   LOOP   EXECUTE 'DROP FUNCTION '||fonction||';';
+   LOOP EXECUTE 'DROP FUNCTION '||fonction||';';
    END LOOP;
 
 -- Fonctions utilisées par le hub
@@ -627,25 +627,34 @@ DECLARE isvid varchar;
 BEGIN
 --- Variables
 connction = 'hostaddr='||hote||' port='||port||' dbname='||dbname||' user='||utilisateur||' password='||mdp||'';
+EXECUTE 'SELECT * FROM dblink_connect_u(''link'','''||connction||''');';
 
-CASE WHEN jdd = 'data' OR jdd = 'taxa' THEN 
-   EXECUTE 'SELECT * from dblink('''||connction||''', ''SELECT CASE WHEN string_agg(''''''''''''''''''''''''||cd_jdd||'''''''''''''''''''''''','''','''') IS NULL THEN ''''vide'''' ELSE string_agg(''''''''''''''''''''''''||cd_jdd||'''''''''''''''''''''''','''','''') END FROM "'||libSchema_from||'".metadonnees WHERE typ_jdd = '''''||jdd||''''''') as t1 (listJdd varchar);' INTO listJdd;
+CASE WHEN jdd = 'data' OR jdd = 'taxa' THEN    
+   EXECUTE 'SELECT * FROM dblink_send_query(''link'',''SELECT CASE WHEN string_agg(''''''''''''''''''''''''||cd_jdd||'''''''''''''''''''''''','''','''') IS NULL THEN ''''vide'''' ELSE string_agg(''''''''''''''''''''''''||cd_jdd||'''''''''''''''''''''''','''','''') END FROM "'||libSchema_from||'".metadonnees WHERE typ_jdd = '''''||jdd||'''''''); as t1';
+   EXECUTE 'SELECT * FROM dblink_get_result(''link'') as t1(listJdd varchar);' INTO listJdd;
+   PERFORM dblink_disconnect('link');
    typJdd = jdd;
 ELSE 
-   listJdd := ''''||jdd||'''';
-   EXECUTE 'SELECT * from dblink('''||connction||''', ''SELECT CASE WHEN typ_jdd IS NULL THEN ''''vide'''' ELSE typ_jdd END FROM "'||libSchema_from||'".metadonnees WHERE cd_jdd = '''||jdd||''''') as t1 (typJdd varchar);' INTO typJdd;
+   listJdd := ''''''||jdd||'''''';
+   EXECUTE 'SELECT * FROM dblink_send_query(''link'',''SELECT CASE WHEN typ_jdd IS NULL THEN ''''vide'''' ELSE typ_jdd END FROM "'||libSchema_from||'".metadonnees WHERE cd_jdd = '''''||jdd||''''''') as t1;';
+   EXECUTE 'SELECT * FROM dblink_get_result(''link'') as t1(typJdd varchar);' INTO typJdd;
+   PERFORM dblink_disconnect('link');
 END CASE;
 
 --- Commande
 FOR libTable IN EXECUTE 'SELECT cd_table FROM ref.fsd WHERE typ_jdd = '''||typJdd||''' OR typ_jdd = ''meta'' GROUP BY cd_table' 
 	LOOP
-	EXECUTE 'SELECT string_agg(one.cd_champ||'' ''||one.format,'','') FROM (SELECT cd_champ, format FROM ref.fsd WHERE (typ_jdd = '''||typjdd||''' OR typ_jdd = ''meta'') AND cd_table = '''||libTable||''' ORDER BY ordre_champ) as one;' INTO list_champ;		
-	EXECUTE 'INSERT INTO '||libSchema_to||'.temp_'||libTable||' SELECT * from dblink('''||connction||''', ''SELECT * FROM '||libSchema_from||'.'||libTable||' WHERE cd_jdd IN ('||listJdd||')'') as t1 ('||list_champ||');';
+	EXECUTE 'SELECT * FROM dblink_connect_u(''link'','''||connction||''');';
+	EXECUTE 'SELECT string_agg(one.cd_champ||'' ''||one.format,'','') FROM (SELECT cd_champ, format FROM ref.fsd WHERE (typ_jdd = '''||typjdd||''' OR typ_jdd = ''meta'') AND cd_table = '''||libTable||''' ORDER BY ordre_champ) as one;' INTO list_champ;
+	EXECUTE 'SELECT * from dblink_send_query(''link'',''SELECT * FROM '||libSchema_from||'.'||libTable||' WHERE cd_jdd IN ('||listJdd||')'');';
+	EXECUTE 'INSERT INTO '||libSchema_to||'.temp_'||libTable||' SELECT * FROM dblink_get_result(''link'') as t1 ('||list_champ||');';
+	PERFORM dblink_disconnect('link');
 END LOOP;
 
 --- Output&Log
 out.lib_log := jdd||' importé';out.lib_schema := libSchema_to;out.lib_table := '-';out.lib_champ := '-';out.typ_log := 'hub_connect';out.nb_occurence := 1;SELECT CURRENT_TIMESTAMP INTO out.date_log;
 PERFORM hub_log (libSchema_to, out);RETURN next out;
+
 END;$BODY$ LANGUAGE plpgsql;
 
 ---------------------------------------------------------------------------------------------------------
@@ -658,6 +667,7 @@ CREATE OR REPLACE FUNCTION hub_connect_ref(hote varchar, port varchar,dbname var
 $BODY$
 DECLARE out zz_log%rowtype;
 DECLARE connction varchar;
+DECLARE flag integer;
 DECLARE libTable varchar;
 DECLARE structure varchar;
 DECLARE bdlink_structure varchar;
@@ -667,36 +677,41 @@ connction = 'hostaddr='||hote||' port='||port||' dbname='||dbname||' user='||uti
 --- Log
 out.lib_schema := '-';out.lib_table := '-';out.lib_champ := '-';out.typ_log := 'hub_admin_ref';out.nb_occurence := 1; SELECT CURRENT_TIMESTAMP INTO out.date_log;
 
-CASE WHEN refPartie = 'all' THEN
-	DROP SCHEMA IF EXISTS ref CASCADE;
-	CREATE SCHEMA ref;
-	--- Initialisation du meta-référentiel
-	CREATE TABLE ref.aa_meta(id serial NOT NULL, nom_ref varchar, typ varchar, ordre integer, libelle varchar, format varchar, CONSTRAINT aa_meta_pk PRIMARY KEY(id));
-	EXECUTE 'INSERT INTO ref.aa_meta SELECT * FROM dblink('''||connction||''', ''SELECT * FROM ref.aa_meta'') as t1 (id integer, nom_ref character varying, typ character varying, ordre integer, libelle character varying, format character varying)';
-	--- Tables
-	FOR libTable IN EXECUTE 'SELECT nom_ref FROM ref.aa_meta GROUP BY nom_ref  ORDER BY nom_ref'
-		LOOP
-		EXECUTE 'SELECT ''(''||champs||'',''||contrainte||'')''
-			FROM (SELECT nom_ref, string_agg(libelle||'' ''||format,'','') as champs FROM ref.aa_meta WHERE nom_ref = '''||libTable||''' AND typ = ''champ'' GROUP BY nom_ref) as one
-			JOIN (SELECT nom_ref, ''CONSTRAINT ''||nom_ref||''_pk PRIMARY KEY (''||libelle||'')'' as contrainte FROM ref.aa_meta WHERE nom_ref = '''||libTable||''' AND typ = ''cle_primaire'') as two ON one.nom_ref = two.nom_ref
-			' INTO structure;
-		EXECUTE 'SELECT string_agg(libelle||'' ''||format,'','') as champs 
-			FROM (SELECT nom_ref, libelle,CASE WHEN format = ''serial NOT NULL'' OR format = ''serial'' THEN ''integer'' ELSE format END as format
-			FROM ref.aa_meta WHERE nom_ref = '''||libTable||''' AND typ = ''champ'')AS one GROUP BY nom_ref
-			' INTO bdlink_structure;
-		EXECUTE 'CREATE TABLE ref.'||libTable||' '||structure||';'; out.lib_log := libTable||' créée';RETURN next out;
-			
-		EXECUTE 'INSERT INTO ref.'||libTable||' SELECT * FROM dblink('''||connction||''', ''SELECT * FROM ref.'||libTable||''') as t1 ('||bdlink_structure||')';
-		out.lib_log := libTable||' : données importées';RETURN next out;
-		END LOOP;
-ELSE 
-	EXECUTE 'TRUNCATE ref.'||refPartie||';';
+
+--- Case all
+CASE WHEN refPartie = 'all' THEN DROP SCHEMA IF EXISTS ref CASCADE; ELSE END CASE;
+
+-- Création du schema ref
+SELECT DISTINCT 1 INTO flag FROM pg_tables WHERE schemaname = 'ref';
+CASE WHEN flag IS NULL THEN CREATE SCHEMA ref; ELSE END CASE;
+-- Création et mise à jour de la meta-table référentiel
+SELECT DISTINCT 1 INTO flag FROM pg_tables WHERE schemaname = 'ref' AND tablename = 'aa_meta';
+CASE WHEN flag IS NULL THEN CREATE TABLE ref.aa_meta(id serial NOT NULL, nom_ref varchar, typ varchar, ordre integer, libelle varchar, format varchar, CONSTRAINT aa_meta_pk PRIMARY KEY(id)); ELSE END CASE;
+
+TRUNCATE ref.aa_meta;
+EXECUTE 'INSERT INTO ref.aa_meta SELECT * FROM dblink('''||connction||''', ''SELECT * FROM ref.aa_meta'') as t1 (id integer, nom_ref character varying, typ character varying, ordre integer, libelle character varying, format character varying)';
+
+--- Les référentiels
+FOR libTable IN EXECUTE 'SELECT nom_ref FROM ref.aa_meta GROUP BY nom_ref ORDER BY nom_ref'
+	LOOP
+	EXECUTE 'SELECT ''(''||champs||'',''||contrainte||'')''
+		FROM (SELECT nom_ref, string_agg(libelle||'' ''||format,'','') as champs FROM ref.aa_meta WHERE nom_ref = '''||libTable||''' AND typ = ''champ'' GROUP BY nom_ref) as one
+		JOIN (SELECT nom_ref, ''CONSTRAINT ''||nom_ref||''_pk PRIMARY KEY (''||libelle||'')'' as contrainte FROM ref.aa_meta WHERE nom_ref = '''||libTable||''' AND typ = ''cle_primaire'') as two ON one.nom_ref = two.nom_ref
+		' INTO structure;
 	EXECUTE 'SELECT string_agg(libelle||'' ''||format,'','') as champs 
 		FROM (SELECT nom_ref, libelle,CASE WHEN format = ''serial NOT NULL'' OR format = ''serial'' THEN ''integer'' ELSE format END as format
-		FROM ref.aa_meta WHERE nom_ref = '''||refPartie||''' AND typ = ''champ'')AS one GROUP BY nom_ref
+		FROM ref.aa_meta WHERE nom_ref = '''||libTable||''' AND typ = ''champ'')AS one GROUP BY nom_ref
 		' INTO bdlink_structure;
-	EXECUTE 'INSERT INTO ref.'||refPartie||' SELECT * FROM dblink('''||connction||''', ''SELECT * FROM ref.'||refPartie||''') as t1 ('||bdlink_structure||');';
-END CASE;
+
+	CASE WHEN refPartie = 'all' OR refPartie = libTable THEN
+		EXECUTE 'SELECT DISTINCT 1 FROM pg_tables WHERE schemaname = ''ref'' AND tablename = '''||libTable||''';' INTO flag ;
+		CASE WHEN flag IS NULL THEN EXECUTE 'CREATE TABLE ref.'||libTable||' '||structure||';'; out.lib_log := libTable||' créée';RETURN next out; ELSE END CASE;
+		EXECUTE 'TRUNCATE ref.'||libTable||';';
+		
+		EXECUTE 'INSERT INTO ref.'||libTable||' SELECT * FROM dblink('''||connction||''', ''SELECT * FROM ref.'||libTable||''') as t1 ('||bdlink_structure||')';
+		out.lib_log := libTable||' : données importées';RETURN next out;
+	ELSE END CASE;
+END LOOP;
 
 --- Output&Log
 out.lib_log := 'ref mis à jour';out.lib_schema := 'ref';out.lib_table := '-';out.lib_champ := '-';out.typ_log := 'hub_connect_ref';out.nb_occurence := 1;SELECT CURRENT_TIMESTAMP INTO out.date_log;PERFORM hub_log ('public', out);RETURN next out;
@@ -849,7 +864,7 @@ END;$BODY$ LANGUAGE plpgsql;
 --- Description : Exporter les données depuis un hub
 ---------------------------------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION hub_export(libSchema varchar,jdd varchar,path varchar,format varchar = 'fcbn',source varchar = null) RETURNS setof zz_log  AS 
+CREATE OR REPLACE FUNCTION hub_export(libSchema varchar,jdd varchar,path varchar,format varchar = 'fcbn',source varchar = '') RETURNS setof zz_log  AS 
 $BODY$
 DECLARE out zz_log%rowtype;
 DECLARE libTable varchar;
@@ -870,6 +885,7 @@ ELSE
 	typJdd := 'WHERE typ_jdd = '''||typJdd||''' OR typ_jdd = ''meta''';
 	listJdd := 'WHERE cd_jdd IN ('''||jdd||''')';
 END CASE;
+CASE WHEN source = 'temp' THEN source = 'temp_'; ELSE END CASE;
 --- Output&Log
 out.lib_schema := libSchema;out.lib_table := '-';out.lib_champ := '-';out.typ_log := 'hub_export';out.nb_occurence := 1; SELECT CURRENT_TIMESTAMP INTO out.date_log;
 --- Commandes
@@ -887,59 +903,6 @@ ELSE out.lib_log :=  'format ('||format||') non implémenté ou jdd ('||jdd||') 
 END CASE;
 PERFORM hub_log (libSchema, out);RETURN NEXT out;
 END; $BODY$ LANGUAGE plpgsql;
-
----------------------------------------------------------------------------------------------------------
----------------------------------------------------------------------------------------------------------
---- Nom : hub_help 
---- Description : Création de l'aide et Accéder à la description d'un fonction
----------------------------------------------------------------------------------------------------------
----------------------------------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION hub_help(libFonction varchar = 'all') RETURNS setof varchar AS 
-$BODY$
-DECLARE out varchar;
-DECLARE var varchar;
-DECLARE lesvariables varchar;
-DECLARE flag integer;
-DECLARE testFonction varchar;
-BEGIN
---- Variable
-flag := 0;
-FOR testFonction IN EXECUTE 'SELECT nom FROM ref.help'
-LOOP 
-	CASE WHEN testFonction = libFonction THEN flag := 1; ELSE EXECUTE 'SELECT 1;'; END CASE; 
-END LOOP;
---- Commande
-CASE WHEN libFonction = 'all' THEN
-	out := '- Pour accéder à la description d''une fonction : ';RETURN next out;
-	out := '   SELECT * FROM hub_help(''fonction'');';RETURN next out;
-	out := '- Pour utiliser une fonction : ';RETURN next out;
-	out := '  SELECT * FROM fonction(''variables'');';RETURN next out;
-	FOR testFonction IN EXECUTE 'SELECT nom FROM ref.help WHERE objet = ''fonction'''
-	LOOP
-		EXECUTE 'SELECT string_agg(champ,'','') FROM (SELECT pos, champ FROM ref.help_var WHERE nom = '''||testFonction||''' ORDER BY pos) as one;' INTO lesvariables;
-		out := 'SELECT * FROM '||testFonction||'('||lesvariables||')';RETURN next out; 
-	END LOOP;
-WHEN flag = 1 THEN
-	out := '-------------------------'; RETURN next out; 
-	out := 'Nom de la Fonction = '||libFonction;RETURN next out; 
-	EXECUTE 'SELECT ''- Type : ''||type FROM ref.help WHERE nom = '''||libFonction||''';'INTO out;RETURN next out; 
-	EXECUTE 'SELECT ''- Libellé : ''||libelle FROM ref.help WHERE nom = '''||libFonction||''';'INTO out;RETURN next out; 
-	EXECUTE 'SELECT ''- Description : ''||description FROM ref.help WHERE nom = '''||libFonction||''';'INTO out;RETURN next out; 
-	EXECUTE 'SELECT ''- Etat de la fonction : ''||etat FROM ref.help WHERE nom = '''||libFonction||''';'INTO out;RETURN next out;
-	EXECUTE 'SELECT ''- Amélioration à prevoir : ''||amelioration FROM ref.help WHERE nom = '''||libFonction||''';'INTO out;RETURN next out;
-	out := '-------------------------'; RETURN next out; 
-	out := 'Liste des variables :';RETURN next out;
-	FOR var IN EXECUTE 'SELECT lib||valeur||defaut FROM
-		(SELECT a.champ, pos, '' o ''||a.champ||'' : ''||z.libelle as lib FROM ref.help_var a JOIN ref.help z ON a.champ = z.nom WHERE a.nom = '''||libFonction||''') as one
-		LEFT JOIN (SELECT a.champ, CASE WHEN a.valeur_possible <> ''-'' THEN '' / Valeurs admises : ''||a.valeur_possible ELSE '''' END as valeur FROM ref.help_var a WHERE a.nom = '''||libFonction||''') as two ON one.champ = two.champ
-		LEFT JOIN (SELECT a.champ, CASE WHEN a.valeur_defaut <> ''-'' THEN '' / Valeurs par défaut : ''||a.valeur_defaut ELSE '''' END as defaut FROM ref.help_var a WHERE a.nom = '''||libFonction||''') as three ON one.champ = three.champ
-		ORDER BY pos;'
-		LOOP --- variables d'entrées
-		RETURN next var;
-		END LOOP;
-ELSE out := 'Fonction inexistante';RETURN next out;
-END CASE;
-END;$BODY$ LANGUAGE plpgsql;
 
 ---------------------------------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------------------------------
@@ -1520,6 +1483,54 @@ SELECT * into out FROM hub_verif(libSchema,'meta','all');return next out;
 SELECT * into out FROM hub_verif(libSchema,'data','all');return next out;
 SELECT * into out FROM hub_verif(libSchema,'taxa','all');return next out;
 END;$BODY$ LANGUAGE plpgsql;
+
+---------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------
+--- Nom : hub_help 
+--- Description : Création de l'aide et Accéder à la description d'un fonction
+---------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION hub_help() RETURNS setof threecol AS 
+$BODY$
+DECLARE out threecol%rowtype;
+DECLARE nom_fonction varchar;
+DECLARE cmd varchar;
+BEGIN
+--- Variable
+
+--- Commande
+out.col1 := '-------------------------'; out.col2 := '-------------------------'; RETURN next out; 
+out.col1 := ' Pour accéder à la description d''une fonction : ';
+out.col2 := 'SELECT * FROM hub_help(''fonction'');';
+RETURN next out;
+out.col1 := ' Pour utiliser une fonction : '; 
+out.col2 := 'SELECT * FROM fonction(''variables'');';
+RETURN next out;
+out.col1:= ' Liste des fonctions : ';
+out.col2 = 'http://wiki.fcbn.fr/doku.php?id=outil:hub:fonction:liste;';
+RETURN next out;
+out.col1 := '-------------------------'; out.col2 := '-------------------------'; RETURN next out; 
+
+FOR nom_fonction IN EXECUTE 'SELECT DISTINCT routine_name FROM information_schema.routines WHERE  routine_name LIKE ''hub_%'' ORDER BY routine_name'
+LOOP 
+	out.col1 := nom_fonction;
+	cmd = 'SELECT routine_name||''(''||string_agg(parameter_name,'','')||'')'' FROM(
+	SELECT routine_name, z.specific_name, z.parameter_name
+	FROM information_schema.routines a
+	JOIN information_schema.parameters z ON a.specific_name = z.specific_name
+	WHERE  routine_name = '''||nom_fonction||'''
+	ORDER BY routine_name,ordinal_position
+	) as one
+	GROUP BY routine_name, specific_name';
+
+	EXECUTE cmd INTO out.col2;
+	out.col3 := 'http://wiki.fcbn.fr/doku.php?id=outil:hub:fonction:'||nom_fonction;
+	RETURN next out; 
+   END LOOP;
+
+
+END;$BODY$ LANGUAGE plpgsql;
+
 
 ---------------------------------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------------------------------
